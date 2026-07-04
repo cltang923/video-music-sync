@@ -115,21 +115,30 @@ function log(msg) {
 
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-// Captures raw PCM samples by actually playing the file through a hidden media element and
-// tapping the Web Audio graph — more reliable than decodeAudioData, which can fail on iOS
-// Safari/WebKit for some video containers (notably .mov) even when the file plays back fine.
-async function captureAudioSamples(file, { startSec = 0, durSec = null, speed = 1 } = {}) {
+// Creates a media element and immediately calls play() on it, synchronously within the
+// caller's user-gesture (click) handler. iOS Safari revokes permission to autoplay if any
+// real async waiting happens first, so this "priming" call must happen with no awaits before it.
+function primeMediaElement(file) {
   const isAudioOnly = file.type.startsWith("audio/");
   const el = document.createElement(isAudioOnly ? "audio" : "video");
   el.src = URL.createObjectURL(file);
   el.playsInline = true;
   el.muted = false;
+  el.play().catch(() => {}); // may be a no-op until data is ready; errors here are non-fatal
+  return el;
+}
 
+// Captures raw PCM samples from an already-primed media element by playing it back (sped up)
+// and tapping the Web Audio graph — more reliable than decodeAudioData, which can fail on iOS
+// Safari/WebKit for some video containers (notably .mov) even when the file plays back fine.
+async function captureAudioSamples(el, { startSec = 0, durSec = null, speed = 1 } = {}) {
   await new Promise((resolve, reject) => {
+    if (el.readyState >= 1) { resolve(); return; } // HAVE_METADATA already
     el.onloadedmetadata = resolve;
     el.onerror = () => reject(new Error("Failed to load media file for capture"));
   });
 
+  el.pause();
   const captureDur = durSec != null ? durSec : Math.max(0, el.duration - startSec);
   el.currentTime = startSec;
   await new Promise((resolve) => { el.onseeked = resolve; });
@@ -272,19 +281,28 @@ document.getElementById("analyzeBtn").addEventListener("click", async () => {
   }
   const btn = document.getElementById("analyzeBtn");
   btn.disabled = true;
+
+  // Everything below this line, up to and including the two primeMediaElement() calls, must
+  // run synchronously with no awaits in between — this is what keeps iOS Safari's autoplay
+  // permission tied to the click that triggered this handler.
+  const resumePromise = audioCtx.state === "suspended" ? audioCtx.resume() : Promise.resolve();
+  const videoEl = primeMediaElement(videoFile);
+  const musicEl = primeMediaElement(musicFile);
+
   try {
+    await resumePromise;
     queryStartSec = Number(document.getElementById("queryStart").value);
     const queryDur = Number(document.getElementById("queryDur").value);
 
     log(`Capturing video sample clip (~${(queryDur / CAPTURE_SPEED).toFixed(1)}s at ${CAPTURE_SPEED}x speed)...`);
-    const videoCapture = await captureAudioSamples(videoFile, {
+    const videoCapture = await captureAudioSamples(videoEl, {
       startSec: queryStartSec,
       durSec: queryDur,
       speed: CAPTURE_SPEED,
     });
 
     log("Capturing full music track (sped up — longer tracks take longer)...");
-    const musicCapture = await captureAudioSamples(musicFile, { speed: CAPTURE_SPEED });
+    const musicCapture = await captureAudioSamples(musicEl, { speed: CAPTURE_SPEED });
 
     log("Downsampling and computing alignment...");
     const videoDown = downsample(videoCapture.samples, videoCapture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
@@ -374,8 +392,20 @@ function pickMimeType() {
 document.getElementById("renderBtn").addEventListener("click", async () => {
   const btn = document.getElementById("renderBtn");
   btn.disabled = true;
+
+  // Prime both elements synchronously within the click, no awaits before this point —
+  // see the comment on primeMediaElement() above for why this matters on iOS Safari.
+  const resumePromise = audioCtx.state === "suspended" ? audioCtx.resume() : Promise.resolve();
+  const videoEl = document.createElement("video");
+  videoEl.src = URL.createObjectURL(videoFile);
+  videoEl.playsInline = true;
+  videoEl.play().catch(() => {});
+  const musicEl = document.createElement("audio");
+  musicEl.src = URL.createObjectURL(musicFile);
+  musicEl.play().catch(() => {});
+
   try {
-    if (audioCtx.state === "suspended") await audioCtx.resume();
+    await resumePromise;
 
     const offset = currentOffset();
     const musicVol = Number(document.getElementById("musicVol").value);
@@ -384,22 +414,20 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     log(`Rendering with offset ${offset.toFixed(2)}s, music volume ${musicVol}, original volume ${videoVol}`);
     log("This re-plays the video in real time while recording, so it takes about as long as the video itself.");
 
-    const videoEl = document.createElement("video");
-    videoEl.src = URL.createObjectURL(videoFile);
-    videoEl.playsInline = true;
-    const musicEl = document.createElement("audio");
-    musicEl.src = URL.createObjectURL(musicFile);
-
     await Promise.all([
       new Promise((resolve, reject) => {
+        if (videoEl.readyState >= 1) { resolve(); return; }
         videoEl.onloadedmetadata = resolve;
         videoEl.onerror = () => reject(new Error("Failed to load video"));
       }),
       new Promise((resolve, reject) => {
+        if (musicEl.readyState >= 1) { resolve(); return; }
         musicEl.onloadedmetadata = resolve;
         musicEl.onerror = () => reject(new Error("Failed to load music file"));
       }),
     ]);
+    videoEl.pause();
+    musicEl.pause();
 
     const videoSource = audioCtx.createMediaElementSource(videoEl);
     const musicSource = audioCtx.createMediaElementSource(musicEl);
