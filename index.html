@@ -56,7 +56,7 @@
 <body>
 
 <h1>Video Music Sync</h1>
-<p class="hint">If you have a video whose background music is drowned out by voices or ambient noise, and a separate clean audio file of that same music, this tool automatically finds the right offset and mixes them together. Everything runs locally in your phone's browser — your video and audio files are never uploaded anywhere. The first run needs network access to download the processing engine (~30MB); it's reused for the rest of that browser tab session.</p>
+<p class="hint">If you have a video whose background music is drowned out by voices or ambient noise, and a separate clean audio file of that same music, this tool automatically finds the right offset and mixes them together. Everything runs locally in your phone's browser using standard Web Audio / MediaRecorder APIs — your video and audio files are never uploaded anywhere, and there's no large engine to download first.</p>
 
 <section>
   <h2>1. Choose files</h2>
@@ -106,9 +106,6 @@
 </section>
 
 <script type="module">
-import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js";
-import { toBlobURL, fetchFile } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js";
-
 const logEl = document.getElementById("log");
 function log(msg) {
   logEl.textContent += "\n" + msg;
@@ -116,58 +113,41 @@ function log(msg) {
   console.log(msg);
 }
 
-const ffmpeg = new FFmpeg();
-ffmpeg.on("log", ({ message }) => log(message));
-
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Timed out after ${ms / 1000}s: ${label}`)), ms)
-    ),
-  ]);
-}
-
-let ffmpegReady = false;
-async function ensureFFmpeg() {
-  if (ffmpegReady) return;
-  const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm";
-
-  log("Step 1/3: fetching ffmpeg-core.js (~112KB)...");
-  const coreURL = await withTimeout(
-    toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
-    30000,
-    "fetching ffmpeg-core.js"
-  );
-  log("Step 1/3 done.");
-
-  log("Step 2/3: fetching ffmpeg-core.wasm (~30MB)...");
-  const wasmURL = await withTimeout(
-    toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
-    60000,
-    "fetching ffmpeg-core.wasm"
-  );
-  log("Step 2/3 done.");
-
-  log("Step 3/3: initializing engine (ffmpeg.load)...");
-  await withTimeout(
-    ffmpeg.load({ coreURL, wasmURL }),
-    45000,
-    "ffmpeg.load() initialization"
-  );
-  log("Step 3/3 done.");
-
-  ffmpegReady = true;
-  log("Processing engine ready.");
-}
-
-// ---- Audio decoding / cross-correlation alignment ----
-
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-async function decodeWavToFloat32(bytes) {
-  const buf = await audioCtx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-  return buf.getChannelData(0);
+async function decodeFileToAudioBuffer(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  // decodeAudioData reads just the audio track, ignoring any video track present in the container
+  return await audioCtx.decodeAudioData(arrayBuffer);
+}
+
+function mixToMono(buffer) {
+  const ch0 = buffer.getChannelData(0);
+  if (buffer.numberOfChannels === 1) return ch0;
+  const ch1 = buffer.getChannelData(1);
+  const out = new Float32Array(ch0.length);
+  for (let i = 0; i < ch0.length; i++) out[i] = (ch0[i] + ch1[i]) / 2;
+  return out;
+}
+
+// Downsample to a low sample rate (block-averaging) so cross-correlation stays fast
+function downsample(buffer, targetRate) {
+  const data = mixToMono(buffer);
+  const ratio = buffer.sampleRate / targetRate;
+  const outLength = Math.floor(data.length / ratio);
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.floor((i + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j < end && j < data.length; j++) {
+      sum += data[j];
+      count++;
+    }
+    out[i] = count > 0 ? sum / count : 0;
+  }
+  return out;
 }
 
 // Normalize (subtract mean, divide by std dev) so sources with different volume levels can still be compared
@@ -185,6 +165,8 @@ function normalize(arr) {
   for (let i = 0; i < out.length; i++) out[i] /= std;
   return out;
 }
+
+const ANALYSIS_RATE = 200; // Hz
 
 // Finds where the query (video sample clip) best matches within the reference (full audio track)
 // Returns { lagSamples, confidence } — lagSamples is the best-matching start sample within reference
@@ -251,37 +233,29 @@ document.getElementById("analyzeBtn").addEventListener("click", async () => {
   const btn = document.getElementById("analyzeBtn");
   btn.disabled = true;
   try {
-    await ensureFFmpeg();
-
     queryStartSec = Number(document.getElementById("queryStart").value);
     const queryDur = Number(document.getElementById("queryDur").value);
 
-    log("Extracting video sample clip...");
-    await ffmpeg.writeFile("video_in", await fetchFile(videoFile));
-    await ffmpeg.exec([
-      "-i", "video_in",
-      "-ss", String(queryStartSec),
-      "-t", String(queryDur),
-      "-vn", "-ac", "1", "-ar", "200",
-      "-f", "wav", "query.wav",
-    ]);
-    const queryBytes = await ffmpeg.readFile("query.wav");
+    log("Decoding video audio track...");
+    const videoBuffer = await decodeFileToAudioBuffer(videoFile);
 
-    log("Extracting full-length music audio...");
-    await ffmpeg.writeFile("music_in", await fetchFile(musicFile));
-    await ffmpeg.exec([
-      "-i", "music_in",
-      "-vn", "-ac", "1", "-ar", "200",
-      "-f", "wav", "reference.wav",
-    ]);
-    const referenceBytes = await ffmpeg.readFile("reference.wav");
+    log("Decoding music file...");
+    const musicBuffer = await decodeFileToAudioBuffer(musicFile);
 
-    log("Decoding and computing alignment...");
-    const queryData = normalize(await decodeWavToFloat32(queryBytes));
-    const referenceData = normalize(await decodeWavToFloat32(referenceBytes));
+    log("Downsampling and computing alignment...");
+    const videoDown = downsample(videoBuffer, ANALYSIS_RATE);
+    const musicDown = downsample(musicBuffer, ANALYSIS_RATE);
 
-    const { lagSamples, confidence } = findBestLag(queryData, referenceData);
-    const lagSeconds = lagSamples / 200;
+    const startIdx = Math.round(queryStartSec * ANALYSIS_RATE);
+    const endIdx = Math.round((queryStartSec + queryDur) * ANALYSIS_RATE);
+    if (endIdx > videoDown.length) {
+      throw new Error("The matching sample extends past the end of the video — reduce the start time or length");
+    }
+    const query = normalize(videoDown.slice(startIdx, endIdx));
+    const reference = normalize(musicDown);
+
+    const { lagSamples, confidence } = findBestLag(query, reference);
+    const lagSeconds = lagSamples / ANALYSIS_RATE;
 
     // On the video's timeline, t=0 corresponds to music-file time = lagSeconds - queryStartSec
     computedOffsetSeconds = lagSeconds - queryStartSec;
@@ -348,57 +322,107 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
   }, 8000);
 });
 
+function pickMimeType() {
+  const candidates = [
+    'video/mp4;codecs="avc1.640028, mp4a.40.2"',
+    "video/mp4",
+    "video/webm;codecs=h264",
+    "video/webm",
+  ];
+  return candidates.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+}
+
 document.getElementById("renderBtn").addEventListener("click", async () => {
   const btn = document.getElementById("renderBtn");
   btn.disabled = true;
   try {
-    await ensureFFmpeg();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+
     const offset = currentOffset();
     const musicVol = Number(document.getElementById("musicVol").value);
     const videoVol = Number(document.getElementById("videoVol").value);
 
     log(`Rendering with offset ${offset.toFixed(2)}s, music volume ${musicVol}, original volume ${videoVol}`);
+    log("This re-plays the video in real time while recording, so it takes about as long as the video itself.");
 
-    // video_in / music_in were already written to ffmpeg's filesystem during analysis, reuse them
-    // offset >= 0 means the music needs to be delayed (adelay); offset < 0 means the music starts earlier (skip ahead in the music file)
-    const filterParts = [];
-    let musicInputArgs = [];
+    const videoEl = document.createElement("video");
+    videoEl.src = URL.createObjectURL(videoFile);
+    videoEl.playsInline = true;
+    const musicEl = document.createElement("audio");
+    musicEl.src = URL.createObjectURL(musicFile);
+
+    await Promise.all([
+      new Promise((resolve, reject) => {
+        videoEl.onloadedmetadata = resolve;
+        videoEl.onerror = () => reject(new Error("Failed to load video"));
+      }),
+      new Promise((resolve, reject) => {
+        musicEl.onloadedmetadata = resolve;
+        musicEl.onerror = () => reject(new Error("Failed to load music file"));
+      }),
+    ]);
+
+    const videoSource = audioCtx.createMediaElementSource(videoEl);
+    const musicSource = audioCtx.createMediaElementSource(musicEl);
+    const videoGain = audioCtx.createGain();
+    videoGain.gain.value = videoVol;
+    const musicGain = audioCtx.createGain();
+    musicGain.gain.value = musicVol;
+    const dest = audioCtx.createMediaStreamDestination();
+    videoSource.connect(videoGain).connect(dest);
+    musicSource.connect(musicGain).connect(dest);
+
+    const videoStream = videoEl.captureStream ? videoEl.captureStream() : videoEl.mozCaptureStream();
+    const videoTrack = videoStream.getVideoTracks()[0];
+    const audioTrack = dest.stream.getAudioTracks()[0];
+    const combinedStream = new MediaStream([videoTrack, audioTrack]);
+
+    const mimeType = pickMimeType();
+    log("Recording using format: " + (mimeType || "browser default"));
+    const recorder = new MediaRecorder(combinedStream, mimeType ? { mimeType } : undefined);
+    const chunks = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+
+    const recordingDone = new Promise((resolve) => {
+      recorder.onstop = resolve;
+    });
+
+    recorder.start();
+
     if (offset >= 0) {
-      const delayMs = Math.round(offset * 1000);
-      filterParts.push(`[1:a]adelay=${delayMs}|${delayMs},volume=${musicVol}[m]`);
+      videoEl.currentTime = 0;
+      await videoEl.play();
+      setTimeout(async () => {
+        musicEl.currentTime = 0;
+        try { await musicEl.play(); } catch (e) { log("Music playback error: " + e.message); }
+      }, offset * 1000);
     } else {
-      musicInputArgs = ["-ss", String(-offset)];
-      filterParts.push(`[1:a]volume=${musicVol}[m]`);
+      musicEl.currentTime = -offset;
+      videoEl.currentTime = 0;
+      await Promise.all([videoEl.play(), musicEl.play()]);
     }
-    filterParts.push(`[0:a]volume=${videoVol}[v]`);
-    filterParts.push(`[v][m]amix=inputs=2:duration=first:dropout_transition=2[aout]`);
-    const filterComplex = filterParts.join(";");
 
-    const args = [
-      "-i", "video_in",
-      ...musicInputArgs,
-      "-i", "music_in",
-      "-filter_complex", filterComplex,
-      "-map", "0:v",
-      "-map", "[aout]",
-      "-c:v", "copy",
-      "-c:a", "aac",
-      "-shortest",
-      "output.mp4",
-    ];
-    await ffmpeg.exec(args);
+    videoEl.onended = () => {
+      musicEl.pause();
+      recorder.stop();
+    };
 
-    const data = await ffmpeg.readFile("output.mp4");
-    const blob = new Blob([data.buffer], { type: "video/mp4" });
+    await recordingDone;
+
+    const blob = new Blob(chunks, { type: mimeType || "video/mp4" });
     const url = URL.createObjectURL(blob);
 
     document.getElementById("resultSection").style.display = "block";
     const outVideo = document.getElementById("outVideo");
     outVideo.src = url;
+    const ext = mimeType.includes("webm") ? "webm" : "mp4";
     document.getElementById("downloadLink").href = url;
+    document.getElementById("downloadLink").download = `synced-video.${ext}`;
 
     document.getElementById("shareBtn").onclick = async () => {
-      const file = new File([blob], "synced-video.mp4", { type: "video/mp4" });
+      const file = new File([blob], `synced-video.${ext}`, { type: mimeType || "video/mp4" });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
         await navigator.share({ files: [file], title: "Synced video" });
       } else {
