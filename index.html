@@ -33,9 +33,18 @@
     background: #2d7cf0;
     color: white;
     margin-top: 8px;
+    transition: transform 0.05s ease, filter 0.1s ease;
   }
+  button:hover:not(:disabled) { filter: brightness(1.1); }
+  button:active:not(:disabled) { filter: brightness(0.85); transform: scale(0.98); }
   button:disabled { background: #999; }
   button.secondary { background: #666; }
+  .field-hint {
+    font-size: 0.8rem;
+    opacity: 0.7;
+    margin: 4px 0 0;
+  }
+  .field-hint.warn { opacity: 1; color: #b86000; }
   .row { display: flex; justify-content: space-between; font-size: 0.85rem; }
   #log {
     white-space: pre-wrap;
@@ -51,6 +60,20 @@
   .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; }
   .badge.ok { background: #1a7a3322; color: #1a7a33; }
   .badge.warn { background: #b8860022; color: #b86000; }
+  .scan-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-top: 1px solid #8884;
+    font-size: 0.85rem;
+  }
+  .scan-row button {
+    width: auto;
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    margin-top: 0;
+  }
 </style>
 </head>
 <body>
@@ -66,13 +89,12 @@
   <label for="musicFile">Music / backing track audio file (pick from camera roll)</label>
   <input type="file" id="musicFile" accept="audio/*,video/*" />
 
-  <label for="queryStart">Start of the matching sample (seconds) — pick a section with just music, no talking</label>
-  <input type="number" id="queryStart" value="20" min="0" step="1" />
-
   <label for="queryDur">Length of the matching sample (seconds) — also how long "Preview sample" plays</label>
   <input type="number" id="queryDur" value="25" min="5" step="1" />
 
-  <button id="analyzeBtn">2. Run auto-alignment</button>
+  <button id="scanBtn">Auto-scan for the best match</button>
+
+  <div id="scanResults"></div>
 </section>
 
 <section id="alignSection" style="display:none">
@@ -80,6 +102,7 @@
   <div class="row">
     <span>Match confidence <span id="confidence"></span></span>
   </div>
+  <p class="field-hint">Sample start currently in use: <span id="queryStartDisplay">20</span>s (filled in automatically by the scan)</p>
   <label for="offsetSlider">Fine-tune offset (seconds) — nudge this if the auto-detected result sounds slightly off</label>
   <input type="range" id="offsetSlider" min="-5" max="5" step="0.05" value="0" />
   <div class="row"><span>Current offset:</span><span id="offsetValue">0.00s</span></div>
@@ -91,6 +114,7 @@
   <label for="videoVol">Original video volume (voices / ambient)</label>
   <input type="range" id="videoVol" min="0" max="1" step="0.05" value="0.25" />
 
+  <p class="field-hint warn">Rendering plays the video in real time. Keep this tab in the foreground and don't let your screen lock — switching away pauses the picture (audio keeps going), and the exported video will freeze wherever you left.</p>
   <button id="renderBtn">3. Render mixed video</button>
 </section>
 
@@ -136,6 +160,25 @@ function primeMediaElement(file) {
   el.muted = false;
   el.play().catch(() => {}); // may be a no-op until data is ready; errors here are non-fatal
   return el;
+}
+
+// Just reads a file's duration — muted throughout, since (unlike primeMediaElement) this never
+// goes through captureAudioSamples' silent Web Audio routing, so it would otherwise be audible.
+async function probeDuration(file) {
+  const isAudioOnly = file.type.startsWith("audio/");
+  const el = document.createElement(isAudioOnly ? "audio" : "video");
+  el.src = URL.createObjectURL(file);
+  el.muted = true;
+  el.play().catch(() => {});
+  await new Promise((resolve, reject) => {
+    if (el.readyState >= 1) { resolve(); return; }
+    el.onloadedmetadata = resolve;
+    el.onerror = () => reject(new Error("Failed to load media for duration probe"));
+  });
+  el.pause();
+  const duration = el.duration;
+  URL.revokeObjectURL(el.src);
+  return duration;
 }
 
 // Captures raw PCM samples from an already-primed media element by playing it back (sped up)
@@ -189,7 +232,11 @@ async function captureAudioSamples(el, { startSec = 0, durSec = null, speed = 1 
   return result;
 }
 
-// Downsample to a low sample rate (block-averaging) so cross-correlation stays fast
+// Extracts an amplitude envelope at a low sample rate so cross-correlation stays fast.
+// Audio oscillates around zero, so averaging raw signed samples over a window mostly
+// cancels itself out and throws away the loudness information — samples must be rectified
+// (absolute value) first, the same way real envelope-follower / audio-sync tools do it,
+// so what's left actually represents "how loud is this moment," not near-silence.
 function downsample(samples, sourceRate, targetRate) {
   const ratio = sourceRate / targetRate;
   const outLength = Math.floor(samples.length / ratio);
@@ -200,7 +247,7 @@ function downsample(samples, sourceRate, targetRate) {
     let sum = 0;
     let count = 0;
     for (let j = start; j < end && j < samples.length; j++) {
-      sum += samples[j];
+      sum += Math.abs(samples[j]);
       count++;
     }
     out[i] = count > 0 ? sum / count : 0;
@@ -284,75 +331,124 @@ document.getElementById("musicFile").addEventListener("change", (e) => {
   musicFile = e.target.files[0];
 });
 
-document.getElementById("analyzeBtn").addEventListener("click", async () => {
-  if (!videoFile || !musicFile) {
-    alert("Please choose a video file and a music file first");
-    return;
+// Updates all the "alignment result" UI (used by both a single analysis run and picking a
+// result from the multi-position scan).
+function applyAnalysisResult(startSec, offsetSeconds, confidence) {
+  queryStartSec = startSec;
+  document.getElementById("queryStartDisplay").textContent = startSec;
+  computedOffsetSeconds = offsetSeconds;
+
+  document.getElementById("alignSection").style.display = "block";
+  const slider = document.getElementById("offsetSlider");
+  slider.value = 0; // this slider is an *additional* fine-tune on top of the auto-detected computedOffsetSeconds
+  document.getElementById("offsetValue").textContent = computedOffsetSeconds.toFixed(2) + "s";
+
+  const confEl = document.getElementById("confidence");
+  if (confidence > 0.15) {
+    confEl.textContent = "Looks good";
+    confEl.className = "badge ok";
+  } else {
+    confEl.textContent = "Low confidence — try a cleaner sample or fine-tune manually";
+    confEl.className = "badge warn";
   }
-  const btn = document.getElementById("analyzeBtn");
-  btn.disabled = true;
-
-  // Everything below this line, up to and including the two primeMediaElement() calls, must
-  // run synchronously with no awaits in between — this is what keeps iOS Safari's autoplay
-  // permission tied to the click that triggered this handler.
-  const resumePromise = audioCtx.state === "suspended" ? audioCtx.resume() : Promise.resolve();
-  const videoEl = primeMediaElement(videoFile);
-  const musicEl = primeMediaElement(musicFile);
-
-  try {
-    await resumePromise;
-    queryStartSec = Number(document.getElementById("queryStart").value);
-    const queryDur = Number(document.getElementById("queryDur").value);
-
-    log(`Capturing video sample clip (~${(queryDur / CAPTURE_SPEED).toFixed(1)}s at ${CAPTURE_SPEED}x speed)...`);
-    const videoCapture = await captureAudioSamples(videoEl, {
-      startSec: queryStartSec,
-      durSec: queryDur,
-      speed: CAPTURE_SPEED,
-    });
-
-    log("Capturing full music track (sped up — longer tracks take longer)...");
-    const musicCapture = await captureAudioSamples(musicEl, { speed: CAPTURE_SPEED });
-
-    log("Downsampling and computing alignment...");
-    const videoDown = downsample(videoCapture.samples, videoCapture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
-    const musicDown = downsample(musicCapture.samples, musicCapture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
-
-    const query = normalize(videoDown);
-    const reference = normalize(musicDown);
-
-    const { lagSamples, confidence } = findBestLag(query, reference);
-    const lagSeconds = lagSamples / ANALYSIS_RATE;
-
-    // On the video's timeline, t=0 corresponds to music-file time = lagSeconds - queryStartSec
-    computedOffsetSeconds = lagSeconds - queryStartSec;
-
-    log(`Analysis done: sample clip matches music file at ${lagSeconds.toFixed(2)}s, computed offset ${computedOffsetSeconds.toFixed(2)}s, confidence score ${confidence.toFixed(3)}`);
-
-    document.getElementById("alignSection").style.display = "block";
-    const slider = document.getElementById("offsetSlider");
-    slider.value = 0; // this slider is an *additional* fine-tune on top of the auto-detected computedOffsetSeconds
-    document.getElementById("offsetValue").textContent = computedOffsetSeconds.toFixed(2) + "s";
-
-    const confEl = document.getElementById("confidence");
-    if (confidence > 0.15) {
-      confEl.textContent = "Looks good";
-      confEl.className = "badge ok";
-    } else {
-      confEl.textContent = "Low confidence — try a cleaner sample or fine-tune manually";
-      confEl.className = "badge warn";
-    }
-  } catch (err) {
-    log("Error: " + err.message);
-    alert("Analysis failed: " + err.message);
-  } finally {
-    btn.disabled = false;
-  }
-});
+}
 
 document.getElementById("offsetSlider").addEventListener("input", (e) => {
   const total = computedOffsetSeconds + Number(e.target.value);
   document.getElementById("offsetValue").textContent = total.toFixed(2) + "s";
+});
+
+const TARGET_SCAN_COUNT = 10; // aim for this many candidate positions, spread evenly regardless of video length
+
+document.getElementById("scanBtn").addEventListener("click", async () => {
+  if (!videoFile || !musicFile) {
+    alert("Please choose a video file and a music file first");
+    return;
+  }
+  const btn = document.getElementById("scanBtn");
+  btn.disabled = true;
+  const resultsEl = document.getElementById("scanResults");
+  resultsEl.innerHTML = "";
+
+  const resumePromise = audioCtx.state === "suspended" ? audioCtx.resume() : Promise.resolve();
+  const musicEl = primeMediaElement(musicFile);
+
+  try {
+    await resumePromise;
+    const queryDur = Number(document.getElementById("queryDur").value);
+
+    log("Scan: capturing full music track once (reused for every candidate position)...");
+    const musicCapture = await captureAudioSamples(musicEl, { speed: CAPTURE_SPEED });
+    const musicDown = downsample(musicCapture.samples, musicCapture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
+    const reference = normalize(musicDown);
+
+    log("Scan: checking video length...");
+    const videoDuration = await withTimeout(probeDuration(videoFile), 10000, "loading video metadata");
+
+    // Spread ~TARGET_SCAN_COUNT candidates evenly across the video, regardless of its length —
+    // a fixed step size would barely cover a 1-minute video or under-sample a 4-minute one.
+    const marginStart = 10;
+    const marginEnd = 5;
+    const scannableRange = videoDuration - marginStart - marginEnd - queryDur;
+    const step = Math.max(5, scannableRange / (TARGET_SCAN_COUNT - 1));
+
+    const candidates = [];
+    for (let t = marginStart; t <= marginStart + scannableRange + 0.01; t += step) {
+      candidates.push(Math.round(t));
+    }
+    if (candidates.length === 0) candidates.push(0);
+
+    const results = [];
+    for (const startSec of candidates) {
+      log(`Scan: trying position ${startSec}s (${results.length + 1}/${candidates.length})...`);
+      try {
+        const el = primeMediaElement(videoFile);
+        const capture = await captureAudioSamples(el, { startSec, durSec: queryDur, speed: CAPTURE_SPEED });
+        URL.revokeObjectURL(el.src);
+        const down = downsample(capture.samples, capture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
+        const query = normalize(down);
+        const { lagSamples, confidence } = findBestLag(query, reference);
+        const offsetSeconds = lagSamples / ANALYSIS_RATE - startSec;
+        results.push({ startSec, offsetSeconds, confidence });
+      } catch (err) {
+        log(`Scan: position ${startSec}s failed (${err.message}), skipping`);
+      }
+    }
+
+    log(`Scan done: ${results.length}/${candidates.length} positions succeeded.`);
+
+    if (results.length === 0) {
+      resultsEl.textContent = "All scan positions failed — try running a single analysis instead.";
+    } else {
+      // The highest-confidence candidate is applied automatically. The full list stays visible
+      // underneath so you can override it by eye/ear if a different one actually sounds right.
+      results.sort((a, b) => b.confidence - a.confidence);
+      const top = results[0];
+      applyAnalysisResult(top.startSec, top.offsetSeconds, top.confidence);
+      log(`Auto-applied highest-confidence result: start ${top.startSec}s, offset ${top.offsetSeconds.toFixed(2)}s, confidence ${top.confidence.toFixed(3)}`);
+
+      results.forEach((r, i) => {
+        const row = document.createElement("div");
+        row.className = "scan-row";
+        const confLabel = r.confidence > 0.15 ? "good" : "low";
+        const recommended = i === 0 ? " (Recommended)" : "";
+        row.innerHTML = `<span>Start ${r.startSec}s — offset ${r.offsetSeconds.toFixed(2)}s — confidence ${r.confidence.toFixed(3)} (${confLabel})${recommended}</span>`;
+        const useBtn = document.createElement("button");
+        useBtn.textContent = "Use this";
+        useBtn.addEventListener("click", () => {
+          applyAnalysisResult(r.startSec, r.offsetSeconds, r.confidence);
+          log(`Using scan result: start ${r.startSec}s, offset ${r.offsetSeconds.toFixed(2)}s, confidence ${r.confidence.toFixed(3)}`);
+        });
+        row.appendChild(useBtn);
+        resultsEl.appendChild(row);
+      });
+    }
+  } catch (err) {
+    log("Scan error: " + err.message);
+    alert("Scan failed: " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 function currentOffset() {
@@ -365,12 +461,21 @@ function currentOffset() {
 // can only be called once per element ever, and #previewVideo is reused across preview clicks,
 // so its source/gain nodes are created lazily once and cached here.
 let previewVideoGain = null;
+let stopActivePreview = null; // set while a preview is playing; calling it stops it immediately
 
 document.getElementById("previewBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("previewBtn");
+
+  // If a preview is already playing, this click means "stop it now" instead of starting a new
+  // one — lets you cut a preview short to go adjust the offset instead of waiting it out.
+  if (stopActivePreview) {
+    stopActivePreview();
+    return;
+  }
+
   // Elements are primed with play() immediately (no awaits before it) for the same iOS
   // autoplay-policy reason described on primeMediaElement() above.
-  const btn = document.getElementById("previewBtn");
-  btn.disabled = true; // clicking again mid-playback used to stack a second music track on top
+  btn.textContent = "Stop preview";
 
   const offset = currentOffset();
   const previewDur = Number(document.getElementById("queryDur").value);
@@ -447,16 +552,22 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     `currentTime=${videoEl.currentTime.toFixed(2)} readyState=${videoEl.readyState} networkState=${videoEl.networkState}`
   );
 
-  const cleanupDelay = musicEl.paused ? 0 : previewDur * 1000; // don't wait around if it never actually played
-  setTimeout(() => {
-    videoEl.pause();
+  const cleanup = () => {
+    videoEl.pause(); // left visible, frozen on the last frame — hiding it would shift the layout
     musicEl.pause();
-    videoEl.style.display = "none";
     musicSource.disconnect();
     musicGain.disconnect();
     URL.revokeObjectURL(musicEl.src);
-    btn.disabled = false;
-  }, cleanupDelay);
+    btn.textContent = "Preview sample (skip waiting for full render)";
+    stopActivePreview = null;
+  };
+
+  const cleanupDelay = musicEl.paused ? 0 : previewDur * 1000; // don't wait around if it never actually played
+  const timer = setTimeout(cleanup, cleanupDelay);
+  stopActivePreview = () => {
+    clearTimeout(timer);
+    cleanup();
+  };
 });
 
 function pickMimeType() {
@@ -484,6 +595,15 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
   musicEl.src = URL.createObjectURL(musicFile);
   musicEl.play().catch(() => {});
 
+  // Rendering re-plays the video in real time via requestAnimationFrame, which browsers pause
+  // when the screen locks or the tab goes to the background — the exported video would freeze
+  // at that point (audio keeps recording independently). Wake Lock at least stops the screen
+  // from auto-locking during that window; it can't stop you from switching apps manually.
+  let wakeLock = null;
+  if ("wakeLock" in navigator) {
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* not fatal if unavailable */ }
+  }
+
   try {
     await resumePromise;
 
@@ -492,7 +612,7 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     const videoVol = Number(document.getElementById("videoVol").value);
 
     log(`Rendering with offset ${offset.toFixed(2)}s, music volume ${musicVol}, original volume ${videoVol}`);
-    log("This re-plays the video in real time while recording, so it takes about as long as the video itself.");
+    log("This re-plays the video in real time while recording, so it takes about as long as the video itself. Keep this tab open and in the foreground until it finishes.");
 
     await Promise.all([
       new Promise((resolve, reject) => {
@@ -509,20 +629,53 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     videoEl.pause();
     musicEl.pause();
 
-    // HTMLVideoElement.captureStream() isn't supported on iOS Safari, so instead we draw each
-    // frame onto a canvas and capture *that* — canvas.captureStream() has much better support.
-    const canvas = document.createElement("canvas");
-    canvas.width = videoEl.videoWidth;
-    canvas.height = videoEl.videoHeight;
-    const ctx2d = canvas.getContext("2d");
-    if (!canvas.captureStream) {
-      throw new Error("This browser doesn't support canvas.captureStream() — can't record video here.");
+    // HTMLVideoElement.captureStream() isn't supported on iOS Safari, but IS on most desktop
+    // browsers — use it directly there (cheap, no extra drawing work), and only fall back to
+    // drawing frames onto a canvas (canvas.captureStream() has much wider support, but costs a
+    // full extra render + copy of every frame, which can be too much for real-time capture) on
+    // browsers that need it.
+    let videoTrack;
+    let canvas, ctx2d;
+    let drawing = false;
+    if (typeof videoEl.captureStream === "function") {
+      log("Using native video capture (this browser supports it directly).");
+      videoTrack = videoEl.captureStream().getVideoTracks()[0];
+    } else {
+      log("Native video capture isn't supported here (expected on iOS Safari) — drawing frames to a canvas instead.");
+      canvas = document.createElement("canvas");
+      canvas.width = videoEl.videoWidth;
+      canvas.height = videoEl.videoHeight;
+      ctx2d = canvas.getContext("2d");
+      if (!canvas.captureStream) {
+        throw new Error("This browser doesn't support canvas.captureStream() either — can't record video here.");
+      }
+      drawing = true;
+      (function drawFrame() {
+        if (!drawing) return;
+        ctx2d.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+        requestAnimationFrame(drawFrame);
+      })();
+      videoTrack = canvas.captureStream(60).getVideoTracks()[0];
     }
-    let drawing = true;
-    (function drawFrame() {
-      if (!drawing) return;
-      ctx2d.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-      requestAnimationFrame(drawFrame);
+
+    // For offset >= 0, music needs to start `offset` seconds into the video. A setTimeout tied
+    // to wall-clock time was tried here before, but video playback has its own startup latency
+    // (buffering/decode) that doesn't line up with wall-clock delays, causing a small but real
+    // sync drift versus Preview (which seeks both elements directly and compares actual content).
+    // Watching the video's own currentTime — which reflects real playback progress regardless of
+    // startup latency — and triggering off of that instead keeps this consistent with Preview.
+    // This runs as its own lightweight loop (just a currentTime check, no drawing) so it works
+    // whichever video capture path was used above.
+    let watchingForMusicStart = offset >= 0; // negative-offset case starts both together immediately below
+    (function watchForMusicStart() {
+      if (!watchingForMusicStart) return;
+      if (videoEl.currentTime >= offset) {
+        watchingForMusicStart = false;
+        musicEl.currentTime = 0;
+        musicEl.play().catch((e) => log("Music playback error: " + e.message));
+        return;
+      }
+      requestAnimationFrame(watchForMusicStart);
     })();
 
     const videoSource = audioCtx.createMediaElementSource(videoEl);
@@ -535,8 +688,6 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     videoSource.connect(videoGain).connect(dest);
     musicSource.connect(musicGain).connect(dest);
 
-    const canvasStream = canvas.captureStream(30);
-    const videoTrack = canvasStream.getVideoTracks()[0];
     const audioTrack = dest.stream.getAudioTracks()[0];
     const combinedStream = new MediaStream([videoTrack, audioTrack]);
 
@@ -557,10 +708,7 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     if (offset >= 0) {
       videoEl.currentTime = 0;
       await videoEl.play();
-      setTimeout(async () => {
-        musicEl.currentTime = 0;
-        try { await musicEl.play(); } catch (e) { log("Music playback error: " + e.message); }
-      }, offset * 1000);
+      // music start is triggered by watchForMusicStart() above once videoEl.currentTime reaches `offset`
     } else {
       musicEl.currentTime = -offset;
       videoEl.currentTime = 0;
@@ -569,6 +717,7 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
 
     videoEl.onended = () => {
       drawing = false;
+      watchingForMusicStart = false;
       musicEl.pause();
       recorder.stop();
     };
@@ -600,6 +749,7 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     alert("Render failed: " + err.message);
   } finally {
     btn.disabled = false;
+    if (wakeLock) wakeLock.release().catch(() => {});
   }
 });
 </script>
