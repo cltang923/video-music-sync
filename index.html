@@ -373,6 +373,20 @@ document.getElementById("scanBtn").addEventListener("click", async () => {
   const resumePromise = audioCtx.state === "suspended" ? audioCtx.resume() : Promise.resolve();
   const musicEl = primeMediaElement(musicFile);
 
+  // Each scan position needs its own fresh <video> element (captureAudioSamples calls
+  // createMediaElementSource on it, which can only ever be called once per element), and on
+  // iOS Safari .play() only succeeds when invoked synchronously inside this click handler, before
+  // any await — a fresh element created later, deep in the scan loop below, gets rejected with
+  // "not allowed by the user agent". So every element the loop could possibly need is primed here,
+  // synchronously, up front. The loop can produce at most ~TARGET_SCAN_COUNT+1 candidates
+  // (see step calculation below); +4 leaves headroom for rounding.
+  const videoPool = [];
+  for (let i = 0; i < TARGET_SCAN_COUNT + 4; i++) {
+    const el = primeMediaElement(videoFile);
+    el.pause(); // avoid audibly overlapping playback from every pooled element at once
+    videoPool.push(el);
+  }
+
   try {
     await resumePromise;
     const queryDur = Number(document.getElementById("queryDur").value);
@@ -399,12 +413,13 @@ document.getElementById("scanBtn").addEventListener("click", async () => {
     if (candidates.length === 0) candidates.push(0);
 
     const results = [];
-    for (const startSec of candidates) {
-      log(`Scan: trying position ${startSec}s (${results.length + 1}/${candidates.length})...`);
+    for (let i = 0; i < candidates.length; i++) {
+      const startSec = candidates[i];
+      log(`Scan: trying position ${startSec}s (${i + 1}/${candidates.length})...`);
       try {
-        const el = primeMediaElement(videoFile);
+        const el = videoPool[i];
+        if (!el) throw new Error("ran out of pre-primed video elements for this position");
         const capture = await captureAudioSamples(el, { startSec, durSec: queryDur, speed: CAPTURE_SPEED });
-        URL.revokeObjectURL(el.src);
         const down = downsample(capture.samples, capture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
         const query = normalize(down);
         const { lagSamples, confidence } = findBestLag(query, reference);
@@ -447,6 +462,10 @@ document.getElementById("scanBtn").addEventListener("click", async () => {
     log("Scan error: " + err.message);
     alert("Scan failed: " + err.message);
   } finally {
+    // Revoke every pooled element's object URL — captureAudioSamples already revoked the ones
+    // it used (revoking twice is a harmless no-op), this just catches any left unused, including
+    // if the scan errored out before or partway through the loop above.
+    videoPool.forEach((el) => URL.revokeObjectURL(el.src));
     btn.disabled = false;
   }
 });
