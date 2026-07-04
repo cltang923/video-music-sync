@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Video Music Sync</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 16px;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.25rem; }
+  section {
+    border: 1px solid #8888;
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  section h2 { font-size: 1rem; margin-top: 0; }
+  label { display: block; font-size: 0.9rem; margin: 8px 0 4px; }
+  input[type="file"] { width: 100%; }
+  input[type="range"] { width: 100%; }
+  button {
+    width: 100%;
+    padding: 12px;
+    font-size: 1rem;
+    border-radius: 8px;
+    border: none;
+    background: #2d7cf0;
+    color: white;
+    margin-top: 8px;
+  }
+  button:disabled { background: #999; }
+  button.secondary { background: #666; }
+  .row { display: flex; justify-content: space-between; font-size: 0.85rem; }
+  #log {
+    white-space: pre-wrap;
+    font-size: 0.75rem;
+    background: #0002;
+    padding: 8px;
+    border-radius: 6px;
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  video { width: 100%; border-radius: 8px; margin-top: 8px; }
+  .hint { font-size: 0.8rem; opacity: 0.75; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; }
+  .badge.ok { background: #1a7a3322; color: #1a7a33; }
+  .badge.warn { background: #b8860022; color: #b86000; }
+</style>
+</head>
+<body>
+
+<h1>Video Music Sync</h1>
+<p class="hint">If you have a video whose background music is drowned out by voices or ambient noise, and a separate clean audio file of that same music, this tool automatically finds the right offset and mixes them together. Everything runs locally in your phone's browser — your video and audio files are never uploaded anywhere. The first run needs network access to download the processing engine (~25MB); it's reused for the rest of that browser tab session.</p>
+
+<section>
+  <h2>1. Choose files</h2>
+  <label for="videoFile">Video file (pick from camera roll)</label>
+  <input type="file" id="videoFile" accept="video/*" />
+
+  <label for="musicFile">Music / backing track audio file (pick from camera roll)</label>
+  <input type="file" id="musicFile" accept="audio/*,video/*" />
+
+  <label for="queryStart">Start of the matching sample (seconds) — pick a section with just music, no talking</label>
+  <input type="number" id="queryStart" value="20" min="0" step="1" />
+
+  <label for="queryDur">Length of the matching sample (seconds)</label>
+  <input type="number" id="queryDur" value="25" min="5" step="1" />
+
+  <button id="analyzeBtn">2. Run auto-alignment</button>
+</section>
+
+<section id="alignSection" style="display:none">
+  <h2>2. Alignment result</h2>
+  <div class="row">
+    <span>Match confidence <span id="confidence"></span></span>
+  </div>
+  <label for="offsetSlider">Fine-tune offset (seconds) — nudge this if the auto-detected result sounds slightly off</label>
+  <input type="range" id="offsetSlider" min="-5" max="5" step="0.05" value="0" />
+  <div class="row"><span>Current offset:</span><span id="offsetValue">0.00s</span></div>
+  <button id="previewBtn" class="secondary">Preview sample (skip waiting for full render)</button>
+
+  <label for="musicVol">Music volume</label>
+  <input type="range" id="musicVol" min="0" max="1.5" step="0.05" value="1.1" />
+  <label for="videoVol">Original video volume (voices / ambient)</label>
+  <input type="range" id="videoVol" min="0" max="1" step="0.05" value="0.25" />
+
+  <button id="renderBtn">3. Render mixed video</button>
+</section>
+
+<section id="resultSection" style="display:none">
+  <h2>3. Output</h2>
+  <video id="outVideo" controls playsinline></video>
+  <button id="shareBtn">Save to camera roll / Share</button>
+  <a id="downloadLink" download="synced-video.mp4"><button class="secondary">Download file</button></a>
+</section>
+
+<section>
+  <h2>Log</h2>
+  <div id="log">Not started yet.</div>
+</section>
+
+<script type="module">
+import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js";
+import { toBlobURL, fetchFile } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js";
+
+const logEl = document.getElementById("log");
+function log(msg) {
+  logEl.textContent += "\n" + msg;
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(msg);
+}
+
+const ffmpeg = new FFmpeg();
+ffmpeg.on("log", ({ message }) => log(message));
+
+let ffmpegReady = false;
+async function ensureFFmpeg() {
+  if (ffmpegReady) return;
+  log("Downloading processing engine (first run takes longer)...");
+  const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm";
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
+    wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
+  });
+  ffmpegReady = true;
+  log("Processing engine ready.");
+}
+
+// ---- Audio decoding / cross-correlation alignment ----
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+async function decodeWavToFloat32(bytes) {
+  const buf = await audioCtx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  return buf.getChannelData(0);
+}
+
+// Normalize (subtract mean, divide by std dev) so sources with different volume levels can still be compared
+function normalize(arr) {
+  let mean = 0;
+  for (let i = 0; i < arr.length; i++) mean += arr[i];
+  mean /= arr.length;
+  let variance = 0;
+  const out = new Float32Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    out[i] = arr[i] - mean;
+    variance += out[i] * out[i];
+  }
+  const std = Math.sqrt(variance / arr.length) || 1;
+  for (let i = 0; i < out.length; i++) out[i] /= std;
+  return out;
+}
+
+// Finds where the query (video sample clip) best matches within the reference (full audio track)
+// Returns { lagSamples, confidence } — lagSamples is the best-matching start sample within reference
+function findBestLag(query, reference) {
+  const qN = query.length;
+  const rN = reference.length;
+  if (rN < qN) throw new Error("The music file is shorter than the matching sample — shorten the sample length");
+
+  let bestScore = -Infinity;
+  let bestLag = 0;
+  const maxLag = rN - qN;
+
+  // Coarse scan first (skipping samples) to roughly locate the region, so we don't scan every position
+  const coarseStep = Math.max(1, Math.floor(qN / 20));
+  let coarseBestLag = 0;
+  let coarseBestScore = -Infinity;
+  for (let lag = 0; lag <= maxLag; lag += coarseStep) {
+    let score = 0;
+    for (let i = 0; i < qN; i += 4) { // sparser sampling during the coarse pass
+      score += query[i] * reference[lag + i];
+    }
+    if (score > coarseBestScore) {
+      coarseBestScore = score;
+      coarseBestLag = lag;
+    }
+  }
+
+  // Fine scan around the coarse result
+  const fineStart = Math.max(0, coarseBestLag - coarseStep);
+  const fineEnd = Math.min(maxLag, coarseBestLag + coarseStep);
+  for (let lag = fineStart; lag <= fineEnd; lag++) {
+    let score = 0;
+    for (let i = 0; i < qN; i++) {
+      score += query[i] * reference[lag + i];
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestLag = lag;
+    }
+  }
+
+  const confidence = bestScore / qN; // normalized signal, theoretical max close to 1
+  return { lagSamples: bestLag, confidence };
+}
+
+// ---- UI state ----
+
+let videoFile, musicFile;
+let computedOffsetSeconds = 0; // how many seconds the music needs to shift relative to the video (positive = delay music)
+let queryStartSec = 20;
+
+document.getElementById("videoFile").addEventListener("change", (e) => {
+  videoFile = e.target.files[0];
+});
+document.getElementById("musicFile").addEventListener("change", (e) => {
+  musicFile = e.target.files[0];
+});
+
+document.getElementById("analyzeBtn").addEventListener("click", async () => {
+  if (!videoFile || !musicFile) {
+    alert("Please choose a video file and a music file first");
+    return;
+  }
+  const btn = document.getElementById("analyzeBtn");
+  btn.disabled = true;
+  try {
+    await ensureFFmpeg();
+
+    queryStartSec = Number(document.getElementById("queryStart").value);
+    const queryDur = Number(document.getElementById("queryDur").value);
+
+    log("Extracting video sample clip...");
+    await ffmpeg.writeFile("video_in", await fetchFile(videoFile));
+    await ffmpeg.exec([
+      "-i", "video_in",
+      "-ss", String(queryStartSec),
+      "-t", String(queryDur),
+      "-vn", "-ac", "1", "-ar", "200",
+      "-f", "wav", "query.wav",
+    ]);
+    const queryBytes = await ffmpeg.readFile("query.wav");
+
+    log("Extracting full-length music audio...");
+    await ffmpeg.writeFile("music_in", await fetchFile(musicFile));
+    await ffmpeg.exec([
+      "-i", "music_in",
+      "-vn", "-ac", "1", "-ar", "200",
+      "-f", "wav", "reference.wav",
+    ]);
+    const referenceBytes = await ffmpeg.readFile("reference.wav");
+
+    log("Decoding and computing alignment...");
+    const queryData = normalize(await decodeWavToFloat32(queryBytes));
+    const referenceData = normalize(await decodeWavToFloat32(referenceBytes));
+
+    const { lagSamples, confidence } = findBestLag(queryData, referenceData);
+    const lagSeconds = lagSamples / 200;
+
+    // On the video's timeline, t=0 corresponds to music-file time = lagSeconds - queryStartSec
+    computedOffsetSeconds = lagSeconds - queryStartSec;
+
+    log(`Analysis done: sample clip matches music file at ${lagSeconds.toFixed(2)}s, computed offset ${computedOffsetSeconds.toFixed(2)}s, confidence score ${confidence.toFixed(3)}`);
+
+    document.getElementById("alignSection").style.display = "block";
+    const slider = document.getElementById("offsetSlider");
+    slider.value = 0; // this slider is an *additional* fine-tune on top of the auto-detected computedOffsetSeconds
+    document.getElementById("offsetValue").textContent = computedOffsetSeconds.toFixed(2) + "s";
+
+    const confEl = document.getElementById("confidence");
+    if (confidence > 0.15) {
+      confEl.textContent = "Looks good";
+      confEl.className = "badge ok";
+    } else {
+      confEl.textContent = "Low confidence — try a cleaner sample or fine-tune manually";
+      confEl.className = "badge warn";
+    }
+  } catch (err) {
+    log("Error: " + err.message);
+    alert("Analysis failed: " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("offsetSlider").addEventListener("input", (e) => {
+  const total = computedOffsetSeconds + Number(e.target.value);
+  document.getElementById("offsetValue").textContent = total.toFixed(2) + "s";
+});
+
+function currentOffset() {
+  return computedOffsetSeconds + Number(document.getElementById("offsetSlider").value);
+}
+
+document.getElementById("previewBtn").addEventListener("click", async () => {
+  // Quick sync check using native <video>/<audio> playback, no need to wait for a full render
+  const offset = currentOffset();
+  const videoEl = document.createElement("video");
+  videoEl.src = URL.createObjectURL(videoFile);
+  videoEl.currentTime = queryStartSec;
+  videoEl.muted = false;
+  videoEl.volume = Number(document.getElementById("videoVol").value);
+
+  const musicEl = document.createElement("audio");
+  musicEl.src = URL.createObjectURL(musicFile);
+  musicEl.volume = Number(document.getElementById("musicVol").value) > 1 ? 1 : Number(document.getElementById("musicVol").value);
+
+  const musicStart = queryStartSec + offset;
+  musicEl.currentTime = Math.max(0, musicStart);
+
+  await Promise.all([
+    new Promise((r) => (videoEl.onseeked = r)),
+    new Promise((r) => (musicEl.onseeked = r)),
+  ]);
+
+  videoEl.play();
+  musicEl.play();
+  log("Playing preview (~8 seconds)...");
+  setTimeout(() => {
+    videoEl.pause();
+    musicEl.pause();
+  }, 8000);
+});
+
+document.getElementById("renderBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("renderBtn");
+  btn.disabled = true;
+  try {
+    await ensureFFmpeg();
+    const offset = currentOffset();
+    const musicVol = Number(document.getElementById("musicVol").value);
+    const videoVol = Number(document.getElementById("videoVol").value);
+
+    log(`Rendering with offset ${offset.toFixed(2)}s, music volume ${musicVol}, original volume ${videoVol}`);
+
+    // video_in / music_in were already written to ffmpeg's filesystem during analysis, reuse them
+    // offset >= 0 means the music needs to be delayed (adelay); offset < 0 means the music starts earlier (skip ahead in the music file)
+    const filterParts = [];
+    let musicInputArgs = [];
+    if (offset >= 0) {
+      const delayMs = Math.round(offset * 1000);
+      filterParts.push(`[1:a]adelay=${delayMs}|${delayMs},volume=${musicVol}[m]`);
+    } else {
+      musicInputArgs = ["-ss", String(-offset)];
+      filterParts.push(`[1:a]volume=${musicVol}[m]`);
+    }
+    filterParts.push(`[0:a]volume=${videoVol}[v]`);
+    filterParts.push(`[v][m]amix=inputs=2:duration=first:dropout_transition=2[aout]`);
+    const filterComplex = filterParts.join(";");
+
+    const args = [
+      "-i", "video_in",
+      ...musicInputArgs,
+      "-i", "music_in",
+      "-filter_complex", filterComplex,
+      "-map", "0:v",
+      "-map", "[aout]",
+      "-c:v", "copy",
+      "-c:a", "aac",
+      "-shortest",
+      "output.mp4",
+    ];
+    await ffmpeg.exec(args);
+
+    const data = await ffmpeg.readFile("output.mp4");
+    const blob = new Blob([data.buffer], { type: "video/mp4" });
+    const url = URL.createObjectURL(blob);
+
+    document.getElementById("resultSection").style.display = "block";
+    const outVideo = document.getElementById("outVideo");
+    outVideo.src = url;
+    document.getElementById("downloadLink").href = url;
+
+    document.getElementById("shareBtn").onclick = async () => {
+      const file = new File([blob], "synced-video.mp4", { type: "video/mp4" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: "Synced video" });
+      } else {
+        alert("This browser doesn't support sharing — use the download button below.");
+      }
+    };
+
+    log("Done.");
+  } catch (err) {
+    log("Error: " + err.message);
+    alert("Render failed: " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
