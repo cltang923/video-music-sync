@@ -359,12 +359,22 @@ function currentOffset() {
   return computedOffsetSeconds + Number(document.getElementById("offsetSlider").value);
 }
 
+// iOS Safari silently ignores HTMLMediaElement.volume on <video> elements (it always plays at
+// full volume regardless of what you set), so volume has to be controlled via a Web Audio
+// GainNode instead — same approach the render step already uses. createMediaElementSource()
+// can only be called once per element ever, and #previewVideo is reused across preview clicks,
+// so its source/gain nodes are created lazily once and cached here.
+let previewVideoGain = null;
+
 document.getElementById("previewBtn").addEventListener("click", async () => {
-  // Quick sync check using native <video>/<audio> playback, no need to wait for a full render.
   // Elements are primed with play() immediately (no awaits before it) for the same iOS
   // autoplay-policy reason described on primeMediaElement() above.
   const offset = currentOffset();
   const previewDur = Number(document.getElementById("queryDur").value);
+
+  // Fire this off but don't await it yet — awaiting here, before the play() primes below, would
+  // reintroduce the "play() after an await" autoplay-policy bug described on primeMediaElement().
+  const resumePromise = audioCtx.state === "suspended" ? audioCtx.resume() : Promise.resolve();
 
   // Reuse the visible <video> placeholder in the page (no `controls`, so no native scrubber to
   // accidentally desync playback with) instead of a detached element, so you can actually see
@@ -372,15 +382,26 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
   const videoEl = document.getElementById("previewVideo");
   videoEl.src = URL.createObjectURL(videoFile);
   videoEl.style.display = "block";
-  videoEl.volume = Number(document.getElementById("videoVol").value);
   videoEl.play().catch(() => {});
+
+  if (!previewVideoGain) {
+    const videoSource = audioCtx.createMediaElementSource(videoEl);
+    previewVideoGain = audioCtx.createGain();
+    videoSource.connect(previewVideoGain).connect(audioCtx.destination);
+  }
+  previewVideoGain.gain.value = Number(document.getElementById("videoVol").value);
 
   const musicEl = document.createElement("audio");
   musicEl.src = URL.createObjectURL(musicFile);
-  musicEl.volume = Math.min(1, Number(document.getElementById("musicVol").value));
   musicEl.play().catch(() => {});
 
+  const musicSource = audioCtx.createMediaElementSource(musicEl);
+  const musicGain = audioCtx.createGain();
+  musicGain.gain.value = Number(document.getElementById("musicVol").value);
+  musicSource.connect(musicGain).connect(audioCtx.destination);
+
   try {
+    await resumePromise;
     log("Preview step 1/3: waiting for both files to load metadata...");
     await withTimeout(
       Promise.all([
@@ -415,11 +436,11 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
   }
 
   log(
-    `Debug — music: paused=${musicEl.paused} muted=${musicEl.muted} volume=${musicEl.volume.toFixed(2)} ` +
+    `Debug — music: paused=${musicEl.paused} gain=${musicGain.gain.value.toFixed(2)} ` +
     `currentTime=${musicEl.currentTime.toFixed(2)} readyState=${musicEl.readyState} networkState=${musicEl.networkState}`
   );
   log(
-    `Debug — video: paused=${videoEl.paused} muted=${videoEl.muted} volume=${videoEl.volume.toFixed(2)} ` +
+    `Debug — video: paused=${videoEl.paused} gain=${previewVideoGain.gain.value.toFixed(2)} ` +
     `currentTime=${videoEl.currentTime.toFixed(2)} readyState=${videoEl.readyState} networkState=${videoEl.networkState}`
   );
 
@@ -427,6 +448,9 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     videoEl.pause();
     musicEl.pause();
     videoEl.style.display = "none";
+    musicSource.disconnect();
+    musicGain.disconnect();
+    URL.revokeObjectURL(musicEl.src);
   }, previewDur * 1000);
 });
 
