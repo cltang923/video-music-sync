@@ -394,6 +394,15 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     log("Preview playback error: " + err.message);
   }
 
+  log(
+    `Debug — music: paused=${musicEl.paused} muted=${musicEl.muted} volume=${musicEl.volume.toFixed(2)} ` +
+    `currentTime=${musicEl.currentTime.toFixed(2)} duration=${musicEl.duration.toFixed(2)} readyState=${musicEl.readyState}`
+  );
+  log(
+    `Debug — video: paused=${videoEl.paused} muted=${videoEl.muted} volume=${videoEl.volume.toFixed(2)} ` +
+    `currentTime=${videoEl.currentTime.toFixed(2)} readyState=${videoEl.readyState}`
+  );
+
   setTimeout(() => {
     videoEl.pause();
     musicEl.pause();
