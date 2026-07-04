@@ -350,29 +350,45 @@ function currentOffset() {
 }
 
 document.getElementById("previewBtn").addEventListener("click", async () => {
-  // Quick sync check using native <video>/<audio> playback, no need to wait for a full render
+  // Quick sync check using native <video>/<audio> playback, no need to wait for a full render.
+  // Elements are primed with play() immediately (no awaits before it) for the same iOS
+  // autoplay-policy reason described on primeMediaElement() above.
   const offset = currentOffset();
+
   const videoEl = document.createElement("video");
   videoEl.src = URL.createObjectURL(videoFile);
-  videoEl.currentTime = queryStartSec;
   videoEl.muted = false;
   videoEl.volume = Number(document.getElementById("videoVol").value);
+  videoEl.play().catch(() => {});
 
   const musicEl = document.createElement("audio");
   musicEl.src = URL.createObjectURL(musicFile);
-  musicEl.volume = Number(document.getElementById("musicVol").value) > 1 ? 1 : Number(document.getElementById("musicVol").value);
+  musicEl.volume = Math.min(1, Number(document.getElementById("musicVol").value));
+  musicEl.play().catch(() => {});
 
-  const musicStart = queryStartSec + offset;
-  musicEl.currentTime = Math.max(0, musicStart);
+  await Promise.all([
+    new Promise((r) => { if (videoEl.readyState >= 1) r(); else videoEl.onloadedmetadata = r; }),
+    new Promise((r) => { if (musicEl.readyState >= 1) r(); else musicEl.onloadedmetadata = r; }),
+  ]);
+  videoEl.pause();
+  musicEl.pause();
+
+  videoEl.currentTime = queryStartSec;
+  const musicStart = Math.max(0, queryStartSec + offset);
+  musicEl.currentTime = musicStart;
 
   await Promise.all([
     new Promise((r) => (videoEl.onseeked = r)),
     new Promise((r) => (musicEl.onseeked = r)),
   ]);
 
-  videoEl.play();
-  musicEl.play();
-  log("Playing preview (~8 seconds)...");
+  try {
+    await Promise.all([videoEl.play(), musicEl.play()]);
+    log("Playing preview (~8 seconds)...");
+  } catch (err) {
+    log("Preview playback error: " + err.message);
+  }
+
   setTimeout(() => {
     videoEl.pause();
     musicEl.pause();
