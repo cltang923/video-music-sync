@@ -369,6 +369,9 @@ let previewVideoGain = null;
 document.getElementById("previewBtn").addEventListener("click", async () => {
   // Elements are primed with play() immediately (no awaits before it) for the same iOS
   // autoplay-policy reason described on primeMediaElement() above.
+  const btn = document.getElementById("previewBtn");
+  btn.disabled = true; // clicking again mid-playback used to stack a second music track on top
+
   const offset = currentOffset();
   const previewDur = Number(document.getElementById("queryDur").value);
 
@@ -444,6 +447,7 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     `currentTime=${videoEl.currentTime.toFixed(2)} readyState=${videoEl.readyState} networkState=${videoEl.networkState}`
   );
 
+  const cleanupDelay = musicEl.paused ? 0 : previewDur * 1000; // don't wait around if it never actually played
   setTimeout(() => {
     videoEl.pause();
     musicEl.pause();
@@ -451,7 +455,8 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     musicSource.disconnect();
     musicGain.disconnect();
     URL.revokeObjectURL(musicEl.src);
-  }, previewDur * 1000);
+    btn.disabled = false;
+  }, cleanupDelay);
 });
 
 function pickMimeType() {
