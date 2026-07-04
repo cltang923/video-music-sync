@@ -115,34 +115,73 @@ function log(msg) {
 
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-async function decodeFileToAudioBuffer(file) {
-  const arrayBuffer = await file.arrayBuffer();
-  // decodeAudioData reads just the audio track, ignoring any video track present in the container
-  return await audioCtx.decodeAudioData(arrayBuffer);
-}
+// Captures raw PCM samples by actually playing the file through a hidden media element and
+// tapping the Web Audio graph — more reliable than decodeAudioData, which can fail on iOS
+// Safari/WebKit for some video containers (notably .mov) even when the file plays back fine.
+async function captureAudioSamples(file, { startSec = 0, durSec = null, speed = 1 } = {}) {
+  const isAudioOnly = file.type.startsWith("audio/");
+  const el = document.createElement(isAudioOnly ? "audio" : "video");
+  el.src = URL.createObjectURL(file);
+  el.playsInline = true;
+  el.muted = false;
 
-function mixToMono(buffer) {
-  const ch0 = buffer.getChannelData(0);
-  if (buffer.numberOfChannels === 1) return ch0;
-  const ch1 = buffer.getChannelData(1);
-  const out = new Float32Array(ch0.length);
-  for (let i = 0; i < ch0.length; i++) out[i] = (ch0[i] + ch1[i]) / 2;
-  return out;
+  await new Promise((resolve, reject) => {
+    el.onloadedmetadata = resolve;
+    el.onerror = () => reject(new Error("Failed to load media file for capture"));
+  });
+
+  const captureDur = durSec != null ? durSec : Math.max(0, el.duration - startSec);
+  el.currentTime = startSec;
+  await new Promise((resolve) => { el.onseeked = resolve; });
+  try { el.playbackRate = speed; } catch (e) { /* fall back to 1x if unsupported */ }
+
+  const source = audioCtx.createMediaElementSource(el);
+  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  const silentGain = audioCtx.createGain();
+  silentGain.gain.value = 0; // keep the graph "live" without playing audibly out loud
+  source.connect(processor);
+  processor.connect(silentGain);
+  silentGain.connect(audioCtx.destination);
+
+  const chunks = [];
+  processor.onaudioprocess = (e) => {
+    chunks.push(e.inputBuffer.getChannelData(0).slice());
+  };
+
+  const result = await new Promise((resolve, reject) => {
+    const finish = () => {
+      clearTimeout(timer);
+      processor.disconnect();
+      source.disconnect();
+      silentGain.disconnect();
+      el.pause();
+      URL.revokeObjectURL(el.src);
+      const total = chunks.reduce((a, c) => a + c.length, 0);
+      const merged = new Float32Array(total);
+      let offset = 0;
+      for (const c of chunks) { merged.set(c, offset); offset += c.length; }
+      resolve({ samples: merged, sampleRate: audioCtx.sampleRate });
+    };
+    el.onended = finish;
+    const timer = setTimeout(finish, (captureDur / speed) * 1000 + 500);
+    el.play().catch(reject);
+  });
+
+  return result;
 }
 
 // Downsample to a low sample rate (block-averaging) so cross-correlation stays fast
-function downsample(buffer, targetRate) {
-  const data = mixToMono(buffer);
-  const ratio = buffer.sampleRate / targetRate;
-  const outLength = Math.floor(data.length / ratio);
+function downsample(samples, sourceRate, targetRate) {
+  const ratio = sourceRate / targetRate;
+  const outLength = Math.floor(samples.length / ratio);
   const out = new Float32Array(outLength);
   for (let i = 0; i < outLength; i++) {
     const start = Math.floor(i * ratio);
     const end = Math.floor((i + 1) * ratio);
     let sum = 0;
     let count = 0;
-    for (let j = start; j < end && j < data.length; j++) {
-      sum += data[j];
+    for (let j = start; j < end && j < samples.length; j++) {
+      sum += samples[j];
       count++;
     }
     out[i] = count > 0 ? sum / count : 0;
@@ -167,6 +206,7 @@ function normalize(arr) {
 }
 
 const ANALYSIS_RATE = 200; // Hz
+const CAPTURE_SPEED = 4; // playback speed multiplier while capturing samples for analysis, to cut wait time
 
 // Finds where the query (video sample clip) best matches within the reference (full audio track)
 // Returns { lagSamples, confidence } — lagSamples is the best-matching start sample within reference
@@ -236,22 +276,21 @@ document.getElementById("analyzeBtn").addEventListener("click", async () => {
     queryStartSec = Number(document.getElementById("queryStart").value);
     const queryDur = Number(document.getElementById("queryDur").value);
 
-    log("Decoding video audio track...");
-    const videoBuffer = await decodeFileToAudioBuffer(videoFile);
+    log(`Capturing video sample clip (~${(queryDur / CAPTURE_SPEED).toFixed(1)}s at ${CAPTURE_SPEED}x speed)...`);
+    const videoCapture = await captureAudioSamples(videoFile, {
+      startSec: queryStartSec,
+      durSec: queryDur,
+      speed: CAPTURE_SPEED,
+    });
 
-    log("Decoding music file...");
-    const musicBuffer = await decodeFileToAudioBuffer(musicFile);
+    log("Capturing full music track (sped up — longer tracks take longer)...");
+    const musicCapture = await captureAudioSamples(musicFile, { speed: CAPTURE_SPEED });
 
     log("Downsampling and computing alignment...");
-    const videoDown = downsample(videoBuffer, ANALYSIS_RATE);
-    const musicDown = downsample(musicBuffer, ANALYSIS_RATE);
+    const videoDown = downsample(videoCapture.samples, videoCapture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
+    const musicDown = downsample(musicCapture.samples, musicCapture.sampleRate / CAPTURE_SPEED, ANALYSIS_RATE);
 
-    const startIdx = Math.round(queryStartSec * ANALYSIS_RATE);
-    const endIdx = Math.round((queryStartSec + queryDur) * ANALYSIS_RATE);
-    if (endIdx > videoDown.length) {
-      throw new Error("The matching sample extends past the end of the video — reduce the start time or length");
-    }
-    const query = normalize(videoDown.slice(startIdx, endIdx));
+    const query = normalize(videoDown);
     const reference = normalize(musicDown);
 
     const { lagSamples, confidence } = findBestLag(query, reference);
