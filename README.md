@@ -5,7 +5,7 @@ A single-HTML-file mobile tool. If you have a video whose background music is dr
 ## How it works
 
 - Pure front-end, no backend server. Open it in your phone's browser, pick two files from your camera roll (the video + the music file), and everything (audio matching, mixing, rendering) runs locally on-device via [ffmpeg.wasm](https://ffmpegwasm.netlify.app/). Neither file is ever uploaded anywhere.
-- The first load needs network access to download the ffmpeg processing engine (~25MB, from the jsdelivr CDN). It's cached for the rest of that browser tab session.
+- The first load needs network access to download the ffmpeg processing engine (~30MB, from the jsdelivr CDN). It's cached for the rest of that browser tab session.
 
 ## Alignment logic
 
