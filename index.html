@@ -357,7 +357,8 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
 
   const videoEl = document.createElement("video");
   videoEl.src = URL.createObjectURL(videoFile);
-  videoEl.muted = false;
+  videoEl.playsInline = true; // without this, iOS takes the video fullscreen with its own scrubber,
+  videoEl.muted = false;      // which can desync it from the separately-playing music track
   videoEl.volume = Number(document.getElementById("videoVol").value);
   videoEl.play().catch(() => {});
 
@@ -445,6 +446,22 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     videoEl.pause();
     musicEl.pause();
 
+    // HTMLVideoElement.captureStream() isn't supported on iOS Safari, so instead we draw each
+    // frame onto a canvas and capture *that* — canvas.captureStream() has much better support.
+    const canvas = document.createElement("canvas");
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    const ctx2d = canvas.getContext("2d");
+    if (!canvas.captureStream) {
+      throw new Error("This browser doesn't support canvas.captureStream() — can't record video here.");
+    }
+    let drawing = true;
+    (function drawFrame() {
+      if (!drawing) return;
+      ctx2d.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      requestAnimationFrame(drawFrame);
+    })();
+
     const videoSource = audioCtx.createMediaElementSource(videoEl);
     const musicSource = audioCtx.createMediaElementSource(musicEl);
     const videoGain = audioCtx.createGain();
@@ -455,8 +472,8 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     videoSource.connect(videoGain).connect(dest);
     musicSource.connect(musicGain).connect(dest);
 
-    const videoStream = videoEl.captureStream ? videoEl.captureStream() : videoEl.mozCaptureStream();
-    const videoTrack = videoStream.getVideoTracks()[0];
+    const canvasStream = canvas.captureStream(30);
+    const videoTrack = canvasStream.getVideoTracks()[0];
     const audioTrack = dest.stream.getAudioTracks()[0];
     const combinedStream = new MediaStream([videoTrack, audioTrack]);
 
@@ -488,6 +505,7 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
     }
 
     videoEl.onended = () => {
+      drawing = false;
       musicEl.pause();
       recorder.stop();
     };
