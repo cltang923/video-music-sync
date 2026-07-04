@@ -677,26 +677,6 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
       videoTrack = canvas.captureStream(60).getVideoTracks()[0];
     }
 
-    // For offset >= 0, music needs to start `offset` seconds into the video. A setTimeout tied
-    // to wall-clock time was tried here before, but video playback has its own startup latency
-    // (buffering/decode) that doesn't line up with wall-clock delays, causing a small but real
-    // sync drift versus Preview (which seeks both elements directly and compares actual content).
-    // Watching the video's own currentTime — which reflects real playback progress regardless of
-    // startup latency — and triggering off of that instead keeps this consistent with Preview.
-    // This runs as its own lightweight loop (just a currentTime check, no drawing) so it works
-    // whichever video capture path was used above.
-    let watchingForMusicStart = offset >= 0; // negative-offset case starts both together immediately below
-    (function watchForMusicStart() {
-      if (!watchingForMusicStart) return;
-      if (videoEl.currentTime >= offset) {
-        watchingForMusicStart = false;
-        musicEl.currentTime = 0;
-        musicEl.play().catch((e) => log("Music playback error: " + e.message));
-        return;
-      }
-      requestAnimationFrame(watchForMusicStart);
-    })();
-
     const videoSource = audioCtx.createMediaElementSource(videoEl);
     const musicSource = audioCtx.createMediaElementSource(musicEl);
     const videoGain = audioCtx.createGain();
@@ -724,19 +704,35 @@ document.getElementById("renderBtn").addEventListener("click", async () => {
 
     recorder.start();
 
+    // Same musicTime = videoTime + offset relationship the alignment analysis computes and
+    // Preview uses (Preview seeks videoEl to queryStartSec and musicEl to queryStartSec + offset —
+    // this is that same formula generalized to videoTime = 0). Previously this branch instead
+    // waited for the video to reach `offset` before starting music from its own time 0, which is
+    // off by a constant 2*offset from the correct sync — that's what caused render's output to be
+    // a fixed amount out of sync while Preview looked fine.
     if (offset >= 0) {
       videoEl.currentTime = 0;
-      await videoEl.play();
-      // music start is triggered by watchForMusicStart() above once videoEl.currentTime reaches `offset`
-    } else {
-      musicEl.currentTime = -offset;
-      videoEl.currentTime = 0;
+      musicEl.currentTime = offset;
       await Promise.all([videoEl.play(), musicEl.play()]);
+    } else {
+      // musicTime would be negative here until the video catches up to time -offset, so video
+      // gets a head start (playing with no music yet) and music joins at its own time 0 once
+      // videoEl.currentTime reaches -offset. Watched via currentTime (not a wall-clock setTimeout)
+      // so video buffering/decode startup latency doesn't throw off when music actually joins.
+      videoEl.currentTime = 0;
+      await videoEl.play();
+      await new Promise((resolve) => {
+        (function waitForVideoCatchUp() {
+          if (videoEl.currentTime >= -offset) { resolve(); return; }
+          requestAnimationFrame(waitForVideoCatchUp);
+        })();
+      });
+      musicEl.currentTime = 0;
+      try { await musicEl.play(); } catch (e) { log("Music playback error: " + e.message); }
     }
 
     videoEl.onended = () => {
       drawing = false;
-      watchingForMusicStart = false;
       musicEl.pause();
       recorder.stop();
     };
