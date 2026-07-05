@@ -152,9 +152,14 @@ function withTimeout(promise, ms, label) {
 // Creates a media element and immediately calls play() on it, synchronously within the
 // caller's user-gesture (click) handler. iOS Safari revokes permission to autoplay if any
 // real async waiting happens first, so this "priming" call must happen with no awaits before it.
+// Only ever used for analysis (tapping a file's audio via createMediaElementSource) — never for
+// visual playback — so this always creates an <audio> element, even for video files (browsers
+// decode just the audio track fine that way). This matters on iOS Safari specifically: it caps
+// how many <video> elements can be concurrently active/decoding in one tab, and the scan flow
+// needs a whole pool of these alive at once (see scanBtn handler) — enough of them as <video>
+// crashes the tab, but <audio> elements are far lighter and don't hit that limit.
 function primeMediaElement(file) {
-  const isAudioOnly = file.type.startsWith("audio/");
-  const el = document.createElement(isAudioOnly ? "audio" : "video");
+  const el = document.createElement("audio");
   el.src = URL.createObjectURL(file);
   el.playsInline = true;
   el.muted = false;
